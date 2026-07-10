@@ -1,6 +1,6 @@
 {
   "id": "autopip",
-  "version": "3.0.0",
+  "version": "3.1.2",
   "name": "Auto Pip Installer Pro",
   "description": {
     "zh_cn": "用于MCDReforged的自动化Python依赖包管理与安装工具"
