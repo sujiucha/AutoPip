@@ -1,0 +1,13 @@
+{
+  "id": "autopip",
+  "version": "3.0.0",
+  "name": "Auto Pip Installer Pro",
+  "description": {
+    "zh_cn": "用于MCDReforged的自动化Python依赖包管理与安装工具"
+  },
+  "author": "sujiucha",
+  "link": "https://github.com/sujiucha/AutoPip",
+  "dependencies": {
+    "mcdreforged": ">=2.0.0"
+  }
+}
