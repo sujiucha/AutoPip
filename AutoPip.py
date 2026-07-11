@@ -1,3 +1,7 @@
+# AutoPip Installer Pro
+# Author: sujiucha
+# Github: https://github.com/sujiucha/AutoPip
+
 import os
 import sys
 import re
@@ -7,19 +11,21 @@ import subprocess
 import threading
 import urllib.request
 import json
+import datetime
 from mcdreforged.api.all import *
 
 PLUGIN_METADATA = {
     'id': 'autopip',
-    'version': '3.2.1',
+    'version': '3.2.2',
     'name': 'Auto Pip Installer Pro',
-    'description': '专业级 MCDR 插件依赖环境管家',
-    'author': 'YourName',
+    'description': '专业级 MCDR 插件依赖环境管家 ',
+    'author': 'sujiucha',
     'link': 'https://github.com/sujiucha/AutoPip'
 }
 
 PREFIX = '§b[AutoPip]§r '
 REPO_URL = "sujiucha/AutoPip"
+BACKUP_FILE = os.path.join('config', PLUGIN_METADATA['id'], 'autopip_backup.txt')
 
 class Configuration(Serializable):
     pip_mirror: str = "https://pypi.tuna.tsinghua.edu.cn/simple"
@@ -33,7 +39,6 @@ def on_load(server: PluginServerInterface, prev):
     load_config(server)
     server.register_help_message('!!pip', 'AutoPip 专业依赖管家', permission=3)
     
-    # 构建指令树
     command_tree = Literal('!!pip').requires(lambda src: src.has_permission(3)).runs(lambda src, ctx: show_help(src)).then(
         Literal('help').runs(lambda src, ctx: show_help(src))
     ).then(
@@ -47,6 +52,10 @@ def on_load(server: PluginServerInterface, prev):
     ).then(
         Literal('update').runs(lambda src, ctx: self_update_plugin(src))
     ).then(
+        Literal('freeze').runs(lambda src, ctx: export_environment(src))
+    ).then(
+        Literal('restore').runs(lambda src, ctx: import_environment(src))
+    ).then(
         Literal('install').runs(lambda src, ctx: install_all_dependencies(src)).then(GreedyText('packages').runs(lambda src, ctx: manage_specific_packages(src, ctx['packages'], 'install')))
     ).then(
         Literal('uninstall').then(GreedyText('packages').runs(lambda src, ctx: manage_specific_packages(src, ctx['packages'], 'uninstall')))
@@ -57,7 +66,6 @@ def on_load(server: PluginServerInterface, prev):
     server.register_command(command_tree)
     server.logger.info(f'[{PLUGIN_METADATA["name"]}] V{PLUGIN_METADATA["version"]} 已加载！')
     
-    # 启动后台守护任务
     boot_silent_scan(server)
     boot_check_update(server)
 
@@ -66,14 +74,16 @@ def show_help(source: CommandSource):
         '§m' + '-'*40,
         f'§bAuto Pip Installer Pro §7v{PLUGIN_METADATA["version"]}',
         '§m' + '-'*40,
-        '§6!!pip check §f- 扫描所有插件缺失的依赖',
+        '§6!!pip check §f- 扫描缺失依赖 (带冲突预警)',
         '§6!!pip install §f- 一键自动安装所有缺失依赖',
-        '§6!!pip install <包名> §f- 手动安装指定 Python 包',
-        '§6!!pip uninstall <包名> §f- 手动强制卸载指定包',
-        '§6!!pip list [搜索词] §f- 查看或搜索已安装的依赖',
-        '§6!!pip outdated §f- 联网检查哪些依赖包可升级',
-        '§6!!pip upgrade <包名> §f- 将指定的包升级到最新',
-        '§6!!pip update §f- §a[热更新] §f一键升级本插件至最新版',
+        '§6!!pip install <包名> §f- 手动安装指定包',
+        '§6!!pip uninstall <包名> §f- 手动卸载指定包',
+        '§6!!pip freeze §f- 导出当前 Python 环境快照备份',
+        '§6!!pip restore §f- 从快照备份中一键恢复环境',
+        '§6!!pip list [包名] §f- 查看或搜索已安装的依赖',
+        '§6!!pip outdated §f- 检查可升级的包',
+        '§6!!pip upgrade <包名> §f- 升级指定包',
+        '§6!!pip update §f- §a[热更新] §f一键升级本插件',
         '§6!!pip reload §f- 热重载插件配置文件',
         '§m' + '-'*40
     ]
@@ -87,7 +97,20 @@ def reload_config_cmd(source: CommandSource):
     load_config(source.get_server())
     source.reply(PREFIX + '§a配置文件已重新加载！')
 
-# 扫描普通目录及压缩包内的依赖配置文件
+def write_log(text: str):
+    log_dir = os.path.join('config', PLUGIN_METADATA['id'])
+    if not os.path.exists(log_dir): 
+        try:
+            os.makedirs(log_dir)
+        except Exception: pass
+    date_str = datetime.datetime.now().strftime('%Y-%m-%d')
+    time_str = datetime.datetime.now().strftime('%H:%M:%S')
+    log_file = os.path.join(log_dir, f'autopip_{date_str}.log')
+    try:
+        with open(log_file, 'a', encoding='utf-8') as f:
+            f.write(f"[{time_str}] {text}\n")
+    except Exception: pass
+
 def get_requirements_files(server: PluginServerInterface):
     plugins_dir = 'plugins'
     req_files = []
@@ -113,26 +136,50 @@ def get_requirements_files(server: PluginServerInterface):
                 except Exception: pass
     return req_files, list(set(packed_pkgs))
 
-# 比对当前环境，筛选出未安装的依赖
-def get_missing_packages(req_files, packed_pkgs):
+def get_all_raw_requirements(req_files, packed_pkgs):
+    all_reqs = []
+    for req_file in req_files:
+        try:
+            with open(req_file, 'r', encoding='utf-8', errors='ignore') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#'): all_reqs.append(line)
+        except Exception: pass
+    all_reqs.extend(packed_pkgs)
+    return all_reqs
+
+def detect_conflicts(raw_reqs):
+    req_map = {}
+    for raw in raw_reqs:
+        match = re.match(r'^([a-zA-Z0-9_\-]+)', raw)
+        if not match: continue
+        name = match.group(1).lower()
+        if name not in req_map: req_map[name] = set()
+        req_map[name].add(raw.replace(' ', ''))
+    
+    conflicts = {}
+    for name, reqs in req_map.items():
+        if len(reqs) > 1:
+            has_strict_limit = False
+            exact_versions = set()
+            for r in reqs:
+                if '==' in r: exact_versions.add(r)
+                if '<' in r or '!=' in r or '~=' in r or '==' in r:
+                    has_strict_limit = True
+            if len(exact_versions) > 1 or has_strict_limit:
+                conflicts[name] = reqs
+    return conflicts
+
+def get_missing_packages(raw_reqs):
     result = subprocess.run([sys.executable, '-m', 'pip', 'list'], stdout=subprocess.PIPE, text=True, encoding='utf-8', errors='ignore')
     installed_packages = result.stdout.lower()
     missing_pkgs = []
-    for req_file in req_files:
-        with open(req_file, 'r', encoding='utf-8', errors='ignore') as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith('#'): continue
-                pkg_name = re.split(r'[=><~]', line)[0].strip().lower()
-                if pkg_name and pkg_name not in installed_packages:
-                    missing_pkgs.append(line)
-    for raw_pkg in packed_pkgs:
-        pkg_name = re.split(r'[=><~]', raw_pkg)[0].strip().lower()
+    for raw in raw_reqs:
+        pkg_name = re.split(r'[=><~]', raw)[0].strip().lower()
         if pkg_name and pkg_name not in installed_packages:
-            missing_pkgs.append(raw_pkg)
+            missing_pkgs.append(raw)
     return list(set(missing_pkgs))
 
-# 版本号对比校验
 def is_version_greater(latest: str, current: str) -> bool:
     try:
         l_parts = [int(i) for i in latest.split('.')]
@@ -146,7 +193,8 @@ def boot_silent_scan(server: PluginServerInterface):
     req_files, packed_pkgs = get_requirements_files(server)
     if not req_files and not packed_pkgs: return
     try:
-        missing_pkgs = get_missing_packages(req_files, packed_pkgs)
+        all_reqs = get_all_raw_requirements(req_files, packed_pkgs)
+        missing_pkgs = get_missing_packages(all_reqs)
         if missing_pkgs:
             time.sleep(6)
             clean_names = [re.split(r'[=><~]', p)[0].strip() for p in missing_pkgs]
@@ -181,10 +229,8 @@ def self_update_plugin(source: CommandSource):
         req = urllib.request.Request(api_url, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=10) as response:
             data = json.loads(response.read().decode('utf-8'))
-            
         latest_version = data['tag_name'].replace('v', '').replace('V', '')
         current_version = PLUGIN_METADATA['version']
-        
         if is_version_greater(latest_version, current_version):
             source.reply(PREFIX + f'§a发现新版本 §ev{latest_version}§a，正在自动下载覆盖...')
             download_url = f"https://mirror.ghproxy.com/https://raw.githubusercontent.com/{REPO_URL}/main/AutoPip.py"
@@ -201,6 +247,48 @@ def self_update_plugin(source: CommandSource):
     except Exception as e:
         source.reply(PREFIX + f'§c热更新失败，请检查网络: {e}')
 
+@new_thread('AutoPip_Freeze')
+def export_environment(source: CommandSource):
+    source.reply(PREFIX + '§7正在导出环境快照，请稍候...')
+    try:
+        config_dir = os.path.dirname(BACKUP_FILE)
+        if not os.path.exists(config_dir): os.makedirs(config_dir)
+        with open(BACKUP_FILE, 'w', encoding='utf-8') as f:
+            subprocess.run([sys.executable, '-m', 'pip', 'freeze'], stdout=f, text=True, encoding='utf-8', errors='ignore')
+        source.reply(PREFIX + f'§a环境快照导出成功！已保存至: §e{BACKUP_FILE}')
+    except Exception as e:
+        source.reply(PREFIX + f'§c快照导出失败: {e}')
+
+@new_thread('AutoPip_Restore')
+def import_environment(source: CommandSource):
+    global is_installing
+    server = source.get_server()
+    if not os.path.exists(BACKUP_FILE):
+        source.reply(PREFIX + f'§c未找到快照文件 ({BACKUP_FILE})。请先使用 !!pip freeze 生成。')
+        return
+    with install_lock:
+        if is_installing:
+            source.reply(PREFIX + '§c后台有任务正在运行，请稍后再试！')
+            return
+        is_installing = True
+    source.reply(PREFIX + '§e开始从快照恢复环境，详见控制台进度...')
+    write_log(f"=== 开始恢复环境快照 ===")
+    try:
+        cmd = [sys.executable, '-m', 'pip', 'install', '-r', BACKUP_FILE]
+        if config.pip_mirror: cmd.extend(['-i', config.pip_mirror])
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='ignore')
+        for line in process.stdout:
+            clean_line = line.strip()
+            if clean_line:
+                server.logger.info(f" [pip] {clean_line}")
+                write_log(f"[pip] {clean_line}")
+        process.wait()
+        if process.returncode == 0: source.reply(PREFIX + '§a环境快照恢复成功！')
+        else: source.reply(PREFIX + '§c快照恢复过程中存在报错，详见控制台或日志。')
+    finally:
+        write_log(f"=== 快照恢复任务结束 ===")
+        with install_lock: is_installing = False
+
 @new_thread('AutoPip_Manage')
 def manage_specific_packages(source: CommandSource, packages_str: str, action: str):
     global is_installing
@@ -212,18 +300,24 @@ def manage_specific_packages(source: CommandSource, packages_str: str, action: s
             return
         is_installing = True
     source.reply(PREFIX + f'§e正在执行 {action}: §b{", ".join(packages)} §e请查看控制台进度...')
+    write_log(f"=== 执行任务: {action} 包名: {', '.join(packages)} ===")
     try:
         if action == 'install': cmd = [sys.executable, '-m', 'pip', 'install'] + packages
         elif action == 'upgrade': cmd = [sys.executable, '-m', 'pip', 'install', '--upgrade'] + packages
         elif action == 'uninstall': cmd = [sys.executable, '-m', 'pip', 'uninstall', '-y'] + packages
         if action != 'uninstall' and config.pip_mirror: cmd.extend(['-i', config.pip_mirror])
+        
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='ignore')
         for line in process.stdout:
-            if line.strip(): server.logger.info(f" [pip] {line.strip()}")
+            clean_line = line.strip()
+            if clean_line:
+                server.logger.info(f" [pip] {clean_line}")
+                write_log(f"[pip] {clean_line}")
         process.wait()
         if process.returncode == 0: source.reply(PREFIX + f'§a操作成功！已完成 {action}。')
-        else: source.reply(PREFIX + f'§c操作失败！请检查控制台报错。')
+        else: source.reply(PREFIX + f'§c操作失败！请检查控制台或日志报错。')
     finally:
+        write_log(f"=== 任务结束 ===")
         with install_lock: is_installing = False
 
 @new_thread('AutoPip_Outdated')
@@ -258,16 +352,25 @@ def check_missing_dependencies(source: CommandSource):
         return
         
     try:
-        missing_pkgs = get_missing_packages(req_files, packed_pkgs)
-        source.reply('§m' + '-'*40)
-        if not missing_pkgs:
+        all_reqs = get_all_raw_requirements(req_files, packed_pkgs)
+        conflicts = detect_conflicts(all_reqs)
+        if conflicts:
+            source.reply('§m' + '-'*40)
+            source.reply(PREFIX + '§c[冲突预警] 发现部分插件对依赖版本的要求存在分歧:')
+            for name, reqs in conflicts.items():
+                source.reply(f' §8> §c{name}: §7{", ".join(reqs)}')
+            server.logger.warning(f"[{PLUGIN_METADATA['name']}] 依赖冲突警告！请留意上述包的版本覆盖问题。")
+        
+        missing_pkgs = get_missing_packages(all_reqs)
+        if not missing_pkgs and not conflicts:
+            source.reply('§m' + '-'*40)
             source.reply(PREFIX + '§a太棒了！所有启用的插件依赖均已满足，环境非常健康！')
-        else:
+        elif missing_pkgs:
+            if not conflicts: source.reply('§m' + '-'*40)
             clean_names = [re.split(r'[=><~]', p)[0].strip() for p in missing_pkgs]
-            source.reply(PREFIX + f'§c警告！发现 §e{len(clean_names)}§c 个缺失的依赖包:')
+            source.reply(PREFIX + f'§c发现 §e{len(clean_names)}§c 个缺失的依赖包:')
             source.reply(f' §8> §7{", ".join(clean_names)}')
             
-            # 兼容游戏内点击输入指令
             if is_console:
                 source.reply(PREFIX + '§e请输入 §c!!pip install §e进行一键自动安装')
             else:
@@ -329,7 +432,6 @@ def on_user_info(server: PluginServerInterface, info):
         if server.get_plugin_command_source(info).has_permission(3):
             print_all_internal(server)
 
-# 异步执行一键安装
 @new_thread('AutoPip_InstallAll')
 def install_all_dependencies(source: CommandSource):
     global is_installing
@@ -345,27 +447,35 @@ def install_all_dependencies(source: CommandSource):
             source.reply(PREFIX + '§a没有发现任何依赖要求。')
             return
             
-        missing_pkgs = get_missing_packages(req_files, packed_pkgs)
+        all_reqs = get_all_raw_requirements(req_files, packed_pkgs)
+        missing_pkgs = get_missing_packages(all_reqs)
         if not missing_pkgs:
             source.reply(PREFIX + '§a所有依赖均已满足，无需重复安装！')
             return
             
-        source.reply(PREFIX + f'§e开始集中安装 {len(missing_pkgs)} 个缺失依赖，详见控制台...')
+        source.reply(PREFIX + f'§e开始集中安装 {len(missing_pkgs)} 个缺失依赖，详见控制台或日志...')
+        write_log(f"=== 集中一键安装缺失依赖: {', '.join(missing_pkgs)} ===")
+        
         cmd = [sys.executable, '-m', 'pip', 'install'] + missing_pkgs
         if config.pip_mirror: cmd.extend(['-i', config.pip_mirror])
         
         try:
             process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='ignore')
             for line in process.stdout:
-                if line.strip(): server.logger.info(f" [pip] {line.strip()}")
+                clean_line = line.strip()
+                if clean_line:
+                    server.logger.info(f" [pip] {clean_line}")
+                    write_log(f"[pip] {clean_line}")
             process.wait()
             
             if process.returncode == 0:
                 source.reply(PREFIX + '§a所有缺失依赖安装完毕！')
             else:
-                source.reply(PREFIX + '§c部分依赖安装失败，请检查控制台红字报错！')
+                source.reply(PREFIX + '§c部分依赖安装失败，请检查控制台或 logs 目录下的日志！')
         except Exception as e:
             server.logger.error(f"执行安装时发生错误: {e}")
+            write_log(f"执行安装发生系统级异常: {e}")
             
     finally:
+        write_log("=== 一键安装任务结束 ===")
         with install_lock: is_installing = False
