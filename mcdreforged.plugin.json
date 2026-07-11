@@ -8,5 +8,5 @@
   "dependencies": {
     "mcdreforged": ">=2.0.0"
   },
-  "entrypoint": "autopip.py"
+  "entrypoint": "autopip"
 }
